@@ -78,7 +78,8 @@ jobs:
 
   build:
     needs: check-version
-    if: needs.check-version.outputs.skip == 'false'
+    # 逻辑：如果是手动触发的，或者检测到有新版本，就执行编译
+    if: github.event_name == 'workflow_dispatch' || needs.check-version.outputs.skip == 'false'
     runs-on: ubuntu-latest
     name: "${{ matrix.arch }}-${{ matrix.sdk }}"
     strategy:
