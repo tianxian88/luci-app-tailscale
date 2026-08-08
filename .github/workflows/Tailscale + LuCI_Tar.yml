@@ -133,18 +133,31 @@ jobs:
 
       - name: "整理产出物"
         run: |
-          find bin/packages/${{ env.EFFECTIVE_ARCH }}/packages_ci/ -type f -name "*TW*" -delete
-          find bin/packages/${{ env.EFFECTIVE_ARCH }}/packages_ci/ -type f ! -name "*.ipk" ! -name "*.apk"
+          TARGET_DIR="bin/packages/${{ matrix.arch }}/packages_ci/"
+          echo "==== 正在清理包含 'TW' 的文件 ===="
+          find "$TARGET_DIR" -type f -name "*TW*" -print -delete
+          echo "==== 正在清理非 .ipk 且非 .apk 的残留文件 ===="
+          find "$TARGET_DIR" -type f ! -name "*.ipk" ! -name "*.apk" -print -delete
+    
+          echo "==== 清理完成，当前目录剩余文件如下 ===="
+          ls -la "$TARGET_DIR"
           tar -zcvf ${{ env.ARCH }}.tar.gz -C bin/packages/${{ env.EFFECTIVE_ARCH }}/packages_ci .
           
 
-      - name: Upload packages
-        if: ${{ env.SKIP_BUILD == '0' }}
+      - name: "统一发布到 Release"
         uses: ncipollo/release-action@v1
         with:
-          name: ${{ github.ref_name }}
+          tag: ${{ needs.check-version.outputs.version }}
+          name: "Tailscale ${{ needs.check-version.outputs.version }} + LuCI ${{ needs.check-version.outputs.luci_version }}"
+          body: |
+
+            | 组件 | 版本 |
+            |------|------|
+            | Tailscale | ${{ needs.check-version.outputs.version }} |
+            | LuCI | ${{ needs.check-version.outputs.luci_version }} |
+            | 构建时间 | ${{ needs.check-version.outputs.build_time }} CST |
+            📖 **安装说明请查看 [README](https://github.com/${{ github.repository }}#readme)**
           token: ${{ secrets.GITHUB_TOKEN }}
           allowUpdates: true
           replacesArtifacts: true
-          prerelease: false
           artifacts: "${{ env.ARCH }}.tar.gz"
