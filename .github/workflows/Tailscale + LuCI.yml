@@ -85,8 +85,7 @@ jobs:
 
       - name: "注入 UPX"
         if: >
-          (github.event_name == 'schedule' || inputs.enable_compression == true) &&
-          !contains('mips64_mips64r2 mips64_octeonplus mips64el_mips64r2', matrix.arch)
+          (github.event_name == 'schedule' || inputs.enable_compression == true) 
         run: |
           sed -i '/$(LN) tailscaled/i \\t/usr/bin/upx --lzma --best $(1)\/usr\/sbin\/tailscaled || true' tailscale/Makefile
           echo "=== 注入后的 install 段 ==="
