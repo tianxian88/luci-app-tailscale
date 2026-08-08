@@ -24,7 +24,7 @@ jobs:
       build_time:   ${{ steps.time.outputs.time }}
       sha:          ${{ steps.push.outputs.sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: "检查 Tailscale 更新"
         id: tailscale
