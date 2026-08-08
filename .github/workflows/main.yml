@@ -1,0 +1,211 @@
+name: "构建 Tailscale + LuCI_tar"
+
+on:
+  workflow_dispatch:
+    inputs:
+      enable_compression:
+        description: '启用 UPX 压缩'
+        required: true
+        type: boolean
+        default: true
+  schedule:
+    - cron: '0 16 * * *'
+
+permissions:
+  contents: write
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version:      ${{ steps.tailscale.outputs.version }}
+      skip:         ${{ steps.tailscale.outputs.skip }}
+      luci_version: ${{ steps.luci.outputs.version }}
+      build_time:   ${{ steps.time.outputs.time }}
+      sha:          ${{ steps.push.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "检查 Tailscale 更新"
+        id: tailscale
+        run: |
+          LATEST=$(curl -s https://github.com | jq -r .tag_name | sed 's/^v//')
+          CURRENT=$(sed -n 's/^PKG_VERSION:=//p' tailscale/Makefile | xargs)
+          
+          if [ -z "$LATEST" ]; then
+            echo "错误: 无法获取上游最新版本号"
+            exit 1
+          fi
+
+          echo "version=v$LATEST" >> $GITHUB_OUTPUT
+          
+          if [ "$LATEST" = "$CURRENT" ]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+            echo "版本未变动，当前已是最新版: $CURRENT"
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+            HASH=$(curl -sL "https://github.com{LATEST}" | sha256sum | cut -d' ' -f1)
+            sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=$LATEST/; s/^PKG_HASH:=.*/PKG_HASH:=$HASH/" tailscale/Makefile
+          fi
+
+      - name: "推送"
+        id: push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@://github.com"
+          
+          PKG_VER=$(sed -n 's/^PKG_VERSION:=//p' tailscale/Makefile | xargs)
+          
+          if [ -n "$(git status --porcelain)" ]; then
+            git commit -am "tailscale: update to ${PKG_VER}"
+            git push
+            echo "成功提交并推送新版本。"
+          else
+            echo "代码无变动，跳过推送。"
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+
+      - name: "获取 LuCI 版本"
+        id: luci
+        run: |
+          echo "version=$(grep -E '^PKG_VERSION:=' luci-app-tailscale/Makefile | cut -d= -f2 | xargs)" >> $GITHUB_OUTPUT
+
+      - name: "生成构建时间"
+        id: time
+        run: echo "time=$(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M:%S')" >> $GITHUB_OUTPUT
+
+  build:
+    needs: check-version
+    # 手动触发或有新更新时触发编译
+    if: github.event_name == 'workflow_dispatch' || needs.check-version.outputs.skip == 'false'
+    runs-on: ubuntu-latest
+    name: "${{ matrix.arch }}-${{ matrix.sdk }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - aarch64_cortex-a53
+          - aarch64_cortex-a72
+          - aarch64_cortex-a76
+          - aarch64_generic
+          - x86_64
+        sdk:
+          - openwrt-25.12
+          - openwrt-24.10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.check-version.outputs.sha }}
+
+      - name: "注入 UPX"
+        if: github.event_name == 'schedule' || inputs.enable_compression
+        run: |
+          sed -i '/$(LN) tailscaled/i \\t/usr/bin/upx --lzma --best $(1)\/usr\/sbin\/tailscaled || true' tailscale/Makefile
+          echo "=== 注入后的 install 段 ==="
+          sed -n '/define Package\/tailscale\/install/,/^endef/p' tailscale/Makefile
+          
+      - name: "编译"
+        id: build
+        uses: sbwml/openwrt-gh-action-sdk@go1.26
+        env:
+          ARCH: ${{ matrix.arch }}-${{ matrix.sdk }}
+          FEEDNAME: packages_ci
+          PACKAGES: luci-app-tailscale
+          NO_REFRESH_CHECK: true
+
+      - name: "整理并打包产出物"
+        run: |
+          ARCH_NAME="${{ matrix.arch }}-${{ matrix.sdk }}"
+          mkdir -p out-tmp
+          mkdir -p out-package
+
+          echo "=== 产出文件 ==="
+          find bin/packages/${{ matrix.arch }}/packages_ci/ -type f | sort
+
+          find bin/packages/${{ matrix.arch }}/packages_ci/ \
+            \( -name "*.apk" -o -name "*.ipk" \) \
+            ! -name "*-dbgsym*" ! -name "*_dbgsym*" | \
+          while read PKG; do
+            BASENAME=$(basename "$PKG")
+            EXT="${BASENAME##*.}"
+
+            if [ "$EXT" = "ipk" ]; then
+              cp "$PKG" "out-tmp/${BASENAME}"
+              echo "放入暂存区: out-tmp/${BASENAME}"
+            elif [ "$EXT" = "apk" ]; then
+              if echo "$BASENAME" | grep -q "^tailscale-"; then
+                NAME="${BASENAME%.*}_${{ matrix.arch }}.${EXT}"
+                cp "$PKG" "out-tmp/${NAME}"
+                echo "放入暂存区: out-tmp/${NAME}"
+              else
+                cp "$PKG" "out-tmp/${BASENAME}"
+                echo "放入暂存区: out-tmp/${BASENAME}"
+              fi
+            fi
+          done
+
+          # 校验暂存区是否为空
+          [ -n "$(ls -A out-tmp/)" ] || { echo "没有找到任何包文件" && exit 1; }
+
+          # 打包成指定的 tar.gz 文件
+          echo "=== 开始打包成 ${ARCH_NAME}.tar.gz ==="
+          tar -zcvf "out-package/${ARCH_NAME}.tar.gz" -C out-tmp .
+          
+          # 清理临时目录
+          rm -rf out-tmp
+
+      - name: "暂存构建构件"
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-${{ matrix.arch }}-${{ matrix.sdk }}
+          path: out-package/*
+          retention-days: 1
+
+  publish-release:
+    needs: [check-version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: "下载所有平台的压缩包"
+        uses: actions/download-artifact@v4
+        with:
+          path: out-release
+          pattern: archive-*
+          merge-multiple: true
+
+      - name: "统一发布到 Release"
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ needs.check-version.outputs.version }}
+          name: "Tailscale ${{ needs.check-version.outputs.version }} + LuCI ${{ needs.check-version.outputs.luci_version }}"
+          body: |
+
+            | 组件 | 版本 |
+            |------|------|
+            | Tailscale | ${{ needs.check-version.outputs.version }} |
+            | LuCI | ${{ needs.check-version.outputs.luci_version }} |
+            | 构建时间 | ${{ needs.check-version.outputs.build_time }} CST |
+            📖 **安装说明请查看 [README](https://github.com{{ github.repository }}#readme)**
+          token: ${{ secrets.GITHUB_TOKEN }}
+          allowUpdates: true
+          replacesArtifacts: true
+          artifacts: "out-release/*"
+
+  report:
+    needs: [check-version, build, publish-release]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: "报告"
+        run: |
+          if [ "${{ needs.check-version.outputs.skip }}" = "true" ] && [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+            echo "# ⏭️ 跳过（版本相同: ${{ needs.check-version.outputs.version }}）" >> $GITHUB_STEP_SUMMARY
+          else
+            cat >> $GITHUB_STEP_SUMMARY <<EOF
+          # 🎯 构建报告
+
+          | 组件 | 版本 | 状态 |
+          |------|------|------|
+          | Tailscale + LuCI | ${{ needs.check-version.outputs.version }} | ${{ needs.build.result == 'success' && '✅' || '❌' }} |
+          **时间:** ${{ needs.check-version.outputs.build_time }} CST
+          EOF
+          fi
