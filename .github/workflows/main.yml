@@ -79,7 +79,9 @@ jobs:
     # 手动触发或有新更新时触发编译
     if: github.event_name == 'workflow_dispatch' || needs.check-version.outputs.skip == 'false'
     runs-on: ubuntu-latest
-    name: "${{ matrix.arch }}-${{ matrix.sdk }}"
+    name: "${{ matrix.arch }}-${{ matrix.tag }}"
+    env:
+      SKIP_BUILD: "0"
     strategy:
       fail-fast: false
       matrix:
@@ -89,11 +91,11 @@ jobs:
           - aarch64_cortex-a76
           - aarch64_generic
           - x86_64
-        sdk:
+        tag:
           - openwrt-25.12
           - openwrt-24.10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.check-version.outputs.sha }}
 
@@ -103,61 +105,44 @@ jobs:
           sed -i '/$(LN) tailscaled/i \\t/usr/bin/upx --lzma --best $(1)\/usr\/sbin\/tailscaled || true' tailscale/Makefile
           echo "=== 注入后的 install 段 ==="
           sed -n '/define Package\/tailscale\/install/,/^endef/p' tailscale/Makefile
+
+      - name: "配置动态架构环境变量"
+        id: setup_env
+        run: |
+          echo "SKIP_BUILD=0" >> $GITHUB_ENV
+          if [ "${{ matrix.tag }}" = "openwrt-25.12" ] && [ "${{ matrix.arch }}" = "riscv64_riscv64" ]; then
+            echo "EFFECTIVE_ARCH=riscv64_generic" >> $GITHUB_ENV
+            echo "ARCH=riscv64_generic-${{ matrix.tag }}" >> $GITHUB_ENV
+          elif [ "${{ matrix.tag }}" = "openwrt-25.12" ] && [ "${{ matrix.arch }}" = "mips_4kec" ]; then
+            echo "SKIP_BUILD=1" >> $GITHUB_ENV
+          else
+            echo "EFFECTIVE_ARCH=${{ matrix.arch }}" >> $GITHUB_ENV
+            echo "ARCH=${{ matrix.arch }}-${{ matrix.tag }}" >> $GITHUB_ENV
+          fi
           
       - name: "编译"
+        # 核心拦截：如果标记了 SKIP_BUILD，则直接跳过本步骤
+        if: ${{ env.SKIP_BUILD == '0' }}
         id: build
         uses: sbwml/openwrt-gh-action-sdk@go1.26
         env:
-          ARCH: ${{ matrix.arch }}-${{ matrix.sdk }}
+          ARCH: ${{ matrix.arch }}-${{ matrix.tag }}
           FEEDNAME: packages_ci
           PACKAGES: luci-app-tailscale
           NO_REFRESH_CHECK: true
 
-      - name: "整理并打包产出物"
+      - name: "清理并直接打包"
         run: |
-          ARCH_NAME="${{ matrix.arch }}-${{ matrix.sdk }}"
-          mkdir -p out-tmp
-          mkdir -p out-package
-
-          echo "=== 产出文件 ==="
-          find bin/packages/${{ matrix.arch }}/packages_ci/ -type f | sort
-
-          find bin/packages/${{ matrix.arch }}/packages_ci/ \
-            \( -name "*.apk" -o -name "*.ipk" \) \
-            ! -name "*-dbgsym*" ! -name "*_dbgsym*" | \
-          while read PKG; do
-            BASENAME=$(basename "$PKG")
-            EXT="${BASENAME##*.}"
-
-            if [ "$EXT" = "ipk" ]; then
-              cp "$PKG" "out-tmp/${BASENAME}"
-              echo "放入暂存区: out-tmp/${BASENAME}"
-            elif [ "$EXT" = "apk" ]; then
-              if echo "$BASENAME" | grep -q "^tailscale-"; then
-                NAME="${BASENAME%.*}_${{ matrix.arch }}.${EXT}"
-                cp "$PKG" "out-tmp/${NAME}"
-                echo "放入暂存区: out-tmp/${NAME}"
-              else
-                cp "$PKG" "out-tmp/${BASENAME}"
-                echo "放入暂存区: out-tmp/${BASENAME}"
-              fi
-            fi
-          done
-
-          # 校验暂存区是否为空
-          [ -n "$(ls -A out-tmp/)" ] || { echo "没有找到任何包文件" && exit 1; }
-
-          # 打包成指定的 tar.gz 文件
-          echo "=== 开始打包成 ${ARCH_NAME}.tar.gz ==="
-          tar -zcvf "out-package/${ARCH_NAME}.tar.gz" -C out-tmp .
+          # 1. 简单粗暴：直接删除目标目录内【所有非 .apk 且非 .ipk】的文件
+          find bin/packages/${{ env.EFFECTIVE_ARCH }}/packages_ci -type f -not -name "*.apk" -not -name "*.ipk" -delete
           
-          # 清理临时目录
-          rm -rf out-tmp
+          # 2. 原地打包：直接打包该源目录，将压缩包输出到当前工作流根目录下
+          tar -zcvf ${{ env.ARCH }}.tar.gz" -C "bin/packages/${{ env.EFFECTIVE_ARCH }}/packages_ci .
 
       - name: "暂存构建构件"
         uses: actions/upload-artifact@v4
         with:
-          name: archive-${{ matrix.arch }}-${{ matrix.sdk }}
+          name: archive-${{ matrix.arch }}-${{ matrix.tag }}
           path: out-package/*
           retention-days: 1
 
