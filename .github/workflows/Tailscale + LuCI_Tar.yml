@@ -1,0 +1,150 @@
+name: "构建 Tailscale + LuCI_Tar"
+
+on:
+  workflow_dispatch:
+    inputs:
+      enable_compression:
+        description: '启用 UPX 压缩'
+        required: true
+        type: boolean
+        default: true
+  schedule:
+    - cron: '0 16 * * *'
+
+permissions:
+  contents: write
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version:      ${{ steps.tailscale.outputs.version }}
+      skip:         ${{ steps.tailscale.outputs.skip }}
+      luci_version: ${{ steps.luci.outputs.version }}
+      build_time:   ${{ steps.time.outputs.time }}
+      sha:          ${{ steps.push.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: "检查 Tailscale 更新"
+        id: tailscale
+        run: |
+          LATEST=$(curl -s https://api.github.com/repos/tailscale/tailscale/releases/latest | jq -r .tag_name | sed 's/^v//')
+          CURRENT=$(sed -n 's/^PKG_VERSION:=//p' tailscale/Makefile | xargs)
+          
+          if [ -z "$LATEST" ]; then
+            echo "错误: 无法获取上游最新版本号"
+            exit 1
+          fi
+
+          echo "version=v$LATEST" >> $GITHUB_OUTPUT
+          
+          if [ "$LATEST" = "$CURRENT" ]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+            echo "版本未变动，当前已是最新版: $CURRENT"
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+            HASH=$(curl -sL "https://codeload.github.com/tailscale/tailscale/tar.gz/v${LATEST}" | sha256sum | cut -d' ' -f1)
+            sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=$LATEST/; s/^PKG_HASH:=.*/PKG_HASH:=$HASH/" tailscale/Makefile
+          fi
+
+      - name: "推送"
+        id: push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          
+          # 安全提取版本号，避免命令注入
+          PKG_VER=$(sed -n 's/^PKG_VERSION:=//p' tailscale/Makefile | xargs)
+          
+          if [ -n "$(git status --porcelain)" ]; then
+            git commit -am "tailscale: update to ${PKG_VER}"
+            git push
+            echo "成功提交并推送新版本。"
+          else
+            echo "代码无变动，跳过推送。"
+          fi
+          # 确保输出当前正确的最新 Commit SHA
+          echo "sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+
+      - name: "获取 LuCI 版本"
+        id: luci
+        run: |
+          echo "version=$(grep -E '^PKG_VERSION:=' luci-app-tailscale/Makefile | cut -d= -f2 | xargs)" >> $GITHUB_OUTPUT
+
+      - name: "生成构建时间"
+        id: time
+        run: echo "time=$(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M:%S')" >> $GITHUB_OUTPUT
+
+  build:
+    needs: check-version
+    # 逻辑：如果是手动触发的，或者检测到有新版本，就执行编译
+    if: github.event_name == 'workflow_dispatch' || needs.check-version.outputs.skip == 'false'
+    runs-on: ubuntu-latest
+    name: "${{ matrix.arch }}-${{ matrix.sdk }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - aarch64_cortex-a53
+          - aarch64_cortex-a72
+          - aarch64_cortex-a76
+          - aarch64_generic
+          - x86_64
+        sdk:
+          - openwrt-25.12
+          - openwrt-24.10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.check-version.outputs.sha }}
+
+      - name: "注入 UPX"
+        # 兼容定时任务和手动触发的布尔判断
+        if: github.event_name == 'schedule' || inputs.enable_compression
+        run: |
+          sed -i '/$(LN) tailscaled/i \\t/usr/bin/upx --lzma --best $(1)\/usr\/sbin\/tailscaled || true' tailscale/Makefile
+          echo "=== 注入后的 install 段 ==="
+          sed -n '/define Package\/tailscale\/install/,/^endef/p' tailscale/Makefile
+      - name: Build preparation
+        run: |
+          echo "SKIP_BUILD=0" >> $GITHUB_ENV
+          if [ "${{ matrix.sdk }}" = "openwrt-25.12" ] && [ "${{ matrix.arch }}" = "riscv64_riscv64" ]; then
+            echo "EFFECTIVE_ARCH=riscv64_generic" >> $GITHUB_ENV
+            echo "ARCH=riscv64_generic-${{ matrix.sdk }}" >> $GITHUB_ENV
+          elif [ "${{ matrix.sdk }}" = "openwrt-25.12" ] && [ "${{ matrix.arch }}" = "mips_4kec" ]; then
+            echo "SKIP_BUILD=1" >> $GITHUB_ENV
+          else
+            echo "EFFECTIVE_ARCH=${{ matrix.arch }}" >> $GITHUB_ENV
+            echo "ARCH=${{ matrix.arch }}-${{ matrix.sdk }}" >> $GITHUB_ENV
+          fi
+
+
+        
+      - name: "编译"
+        if: ${{ env.SKIP_BUILD == '0' }}
+        id: build
+        uses: sbwml/openwrt-gh-action-sdk@go1.26
+        env:
+          ARCH: ${{ matrix.arch }}-${{ matrix.sdk }}
+          FEEDNAME: packages_ci
+          PACKAGES: luci-app-tailscale
+          NO_REFRESH_CHECK: true
+
+      - name: "整理产出物"
+        run: |
+          find bin/packages/${{ env.EFFECTIVE_ARCH }}/packages_ci/ -type f -name "*TW*" -delete
+          find bin/packages/${{ env.EFFECTIVE_ARCH }}/packages_ci/ -type f ! -name "*.ipk" ! -name "*.apk"
+          tar -zcvf ${{ env.ARCH }}.tar.gz -C bin/packages/${{ env.EFFECTIVE_ARCH }}/packages_ci .
+          
+
+      - name: Upload packages
+        if: ${{ env.SKIP_BUILD == '0' }}
+        uses: ncipollo/release-action@v1
+        with:
+          name: ${{ github.ref_name }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          allowUpdates: true
+          replacesArtifacts: true
+          prerelease: false
+          artifacts: "${{ env.ARCH }}.tar.gz"
